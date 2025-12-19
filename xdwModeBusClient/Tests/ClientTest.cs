@@ -1,4 +1,6 @@
 using Microsoft.Extensions.Logging;
+using Serilog;
+using Serilog.Extensions.Logging;
 using xdwModeBusClient.Configuration;
 using xdwModeBusClient.Interfaces;
 using xdwModeBusClient.Models;
@@ -16,11 +18,11 @@ public class ClientTest
 
     public ClientTest()
     {
-        _loggerFactory = LoggerFactory.Create(builder =>
-        {
-            builder.AddConsole();
-            builder.SetMinimumLevel(LogLevel.Debug);
-        });
+        var serilogLogger = new LoggerConfiguration()
+            .MinimumLevel.Debug()
+            .WriteTo.Console()
+            .CreateLogger();
+        _loggerFactory = new SerilogLoggerFactory(serilogLogger);
     }
 
     /// <summary>

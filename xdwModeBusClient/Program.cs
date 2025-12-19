@@ -1,8 +1,7 @@
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Serilog;
+using Serilog.Extensions.Logging;
 using xdwModeBusClient.Configuration;
 using xdwModeBusClient.Interfaces;
 using xdwModeBusClient.Models;
@@ -31,6 +30,9 @@ class Program
             return;
         }
 
+        PollingManager? pollingManager = null;
+        var cts = new CancellationTokenSource();
+
         try
         {
             // 配置Serilog
@@ -42,73 +44,100 @@ class Program
                     outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
                 .CreateLogger();
 
-            // 构建主机
-            var host = Host.CreateDefaultBuilder(args)
-                .UseSerilog()
-                .ConfigureAppConfiguration((context, config) =>
-                {
-                    config.SetBasePath(Directory.GetCurrentDirectory());
-                    config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
-                })
-                .ConfigureServices((context, services) =>
-                {
-                    // 加载配置
-                    var modbusConfig = context.Configuration.GetSection("ModbusConfiguration").Get<ModbusConfiguration>()
-                        ?? throw new InvalidOperationException("无法加载Modbus配置");
+            // 创建日志工厂
+            var loggerFactory = new SerilogLoggerFactory(Log.Logger);
 
-                    services.AddSingleton(modbusConfig);
-
-                    // 注册数据转换器
-                    services.AddSingleton<IDataConverter, DataConverter>();
-
-                    // 注册数据存储
-                    services.AddSingleton<IDataStorage>(sp =>
-                    {
-                        var logger = sp.GetRequiredService<ILogger<JsonFileDataStorage>>();
-                        return new JsonFileDataStorage(logger, modbusConfig.AppSettings.DataStoragePath);
-                    });
-
-                    // 注册数据显示
-                    services.AddSingleton<IDataDisplay, ConsoleDataDisplay>();
-
-                    // 注册数据处理器
-                    services.AddSingleton<IDataProcessor, DataProcessor>();
-
-                    // 注册Modbus客户端
-                    services.AddSingleton<IEnumerable<IModbusClient>>(sp =>
-                    {
-                        var clients = new List<IModbusClient>();
-                        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-
-                        foreach (var connConfig in modbusConfig.Connections.Where(c => c.Enabled))
-                        {
-                            IModbusClient client = connConfig.ConnectionType switch
-                            {
-                                ConnectionType.TCP => new ModbusTcpClient(
-                                    connConfig,
-                                    loggerFactory.CreateLogger<ModbusTcpClient>(),
-                                    modbusConfig.AppSettings.RequestTimeoutMs),
-                                ConnectionType.RTU => new ModbusRtuClient(
-                                    connConfig,
-                                    loggerFactory.CreateLogger<ModbusRtuClient>(),
-                                    modbusConfig.AppSettings.RequestTimeoutMs),
-                                _ => throw new NotSupportedException($"不支持的连接类型: {connConfig.ConnectionType}")
-                            };
-                            clients.Add(client);
-                        }
-
-                        return clients;
-                    });
-
-                    // 注册轮询管理器
-                    services.AddSingleton<PollingManager>();
-
-                    // 注册托管服务
-                    services.AddHostedService<ModbusHostedService>();
-                })
+            // 加载配置
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
                 .Build();
 
-            await host.RunAsync();
+            var modbusConfig = configuration.GetSection("ModbusConfiguration").Get<ModbusConfiguration>()
+                ?? throw new InvalidOperationException("无法加载Modbus配置");
+
+            // 创建数据转换器
+            var dataConverter = new DataConverter();
+
+            // 创建数据存储
+            var dataStorage = new JsonFileDataStorage(
+                loggerFactory.CreateLogger<JsonFileDataStorage>(),
+                modbusConfig.AppSettings.DataStoragePath);
+
+            // 创建数据显示
+            var dataDisplay = new ConsoleDataDisplay(loggerFactory.CreateLogger<ConsoleDataDisplay>());
+
+            // 创建数据处理器
+            var dataProcessor = new DataProcessor(
+                loggerFactory.CreateLogger<DataProcessor>(),
+                dataConverter,
+                dataStorage,
+                dataDisplay);
+
+            // 创建Modbus客户端
+            var clients = new List<IModbusClient>();
+            foreach (var connConfig in modbusConfig.Connections.Where(c => c.Enabled))
+            {
+                IModbusClient client = connConfig.ConnectionType switch
+                {
+                    ConnectionType.TCP => new ModbusTcpClient(
+                        connConfig,
+                        loggerFactory.CreateLogger<ModbusTcpClient>(),
+                        modbusConfig.AppSettings.RequestTimeoutMs),
+                    ConnectionType.RTU => new ModbusRtuClient(
+                        connConfig,
+                        loggerFactory.CreateLogger<ModbusRtuClient>(),
+                        modbusConfig.AppSettings.RequestTimeoutMs),
+                    _ => throw new NotSupportedException($"不支持的连接类型: {connConfig.ConnectionType}")
+                };
+                clients.Add(client);
+            }
+
+            // 创建轮询管理器
+            pollingManager = new PollingManager(
+                loggerFactory.CreateLogger<PollingManager>(),
+                modbusConfig,
+                dataProcessor,
+                dataConverter,
+                clients);
+
+            // 订阅连接状态事件
+            pollingManager.ConnectionStatusChanged += (sender, e) =>
+            {
+                dataDisplay.DisplayConnectionStatus(e.ConnectionId, e.IsConnected);
+            };
+
+            // 显示配置信息
+            PrintConfiguration(modbusConfig);
+
+            // 设置Ctrl+C处理
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                e.Cancel = true;
+                Console.WriteLine("\n正在停止服务...");
+                cts.Cancel();
+            };
+
+            Log.Information("Modbus服务启动");
+
+            // 启动轮询
+            await pollingManager.StartAsync();
+
+            Log.Information("按Ctrl+C停止服务");
+
+            // 等待取消信号
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // 正常取消
+            }
+
+            // 停止轮询
+            Log.Information("Modbus服务停止");
+            await pollingManager.StopAsync();
         }
         catch (Exception ex)
         {
@@ -117,67 +146,20 @@ class Program
         }
         finally
         {
+            pollingManager?.Dispose();
             Log.CloseAndFlush();
         }
     }
-}
 
-/// <summary>
-/// Modbus托管服务
-/// </summary>
-public class ModbusHostedService : IHostedService
-{
-    private readonly ILogger<ModbusHostedService> _logger;
-    private readonly PollingManager _pollingManager;
-    private readonly IDataDisplay _dataDisplay;
-    private readonly ModbusConfiguration _config;
-
-    public ModbusHostedService(
-        ILogger<ModbusHostedService> logger,
-        PollingManager pollingManager,
-        IDataDisplay dataDisplay,
-        ModbusConfiguration config)
-    {
-        _logger = logger;
-        _pollingManager = pollingManager;
-        _dataDisplay = dataDisplay;
-        _config = config;
-    }
-
-    public async Task StartAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("Modbus服务启动");
-
-        // 订阅事件
-        _pollingManager.ConnectionStatusChanged += (sender, e) =>
-        {
-            _dataDisplay.DisplayConnectionStatus(e.ConnectionId, e.IsConnected);
-        };
-
-        // 显示配置信息
-        PrintConfiguration();
-
-        // 启动轮询
-        await _pollingManager.StartAsync();
-
-        _logger.LogInformation("按Ctrl+C停止服务");
-    }
-
-    public async Task StopAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("Modbus服务停止");
-        await _pollingManager.StopAsync();
-    }
-
-    private void PrintConfiguration()
+    private static void PrintConfiguration(ModbusConfiguration config)
     {
         Console.WriteLine("\n配置信息:");
-        Console.WriteLine($"  轮询间隔: {_config.AppSettings.PollingIntervalMs}ms");
-        Console.WriteLine($"  请求超时: {_config.AppSettings.RequestTimeoutMs}ms");
-        Console.WriteLine($"  重试次数: {_config.AppSettings.RetryCount}");
+        Console.WriteLine($"  轮询间隔: {config.AppSettings.PollingIntervalMs}ms");
+        Console.WriteLine($"  请求超时: {config.AppSettings.RequestTimeoutMs}ms");
+        Console.WriteLine($"  重试次数: {config.AppSettings.RetryCount}");
 
-        Console.WriteLine($"\n连接配置 ({_config.Connections.Count(c => c.Enabled)} 个启用):");
-        foreach (var conn in _config.Connections.Where(c => c.Enabled))
+        Console.WriteLine($"\n连接配置 ({config.Connections.Count(c => c.Enabled)} 个启用):");
+        foreach (var conn in config.Connections.Where(c => c.Enabled))
         {
             if (conn.ConnectionType == ConnectionType.TCP && conn.TcpConfig != null)
             {
@@ -189,8 +171,8 @@ public class ModbusHostedService : IHostedService
             }
         }
 
-        Console.WriteLine($"\n数据包配置 ({_config.Packets.Count(p => p.Enabled)} 个启用):");
-        foreach (var packet in _config.Packets.Where(p => p.Enabled))
+        Console.WriteLine($"\n数据包配置 ({config.Packets.Count(p => p.Enabled)} 个启用):");
+        foreach (var packet in config.Packets.Where(p => p.Enabled))
         {
             Console.WriteLine($"  [{packet.PacketId}] {packet.Name}");
             Console.WriteLine($"    从站: {packet.SlaveId}, 功能码: {packet.FunctionCode}, 地址: {packet.StartAddress}, 数量: {packet.RegisterCount}");

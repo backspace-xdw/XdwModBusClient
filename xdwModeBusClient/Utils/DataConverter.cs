@@ -205,33 +205,35 @@ public class DataConverter : IDataConverter
     {
         var bytes = new byte[registerCount * 2];
 
-        // 先按大端模式提取字节
+        // 先按大端模式提取字节 (每个寄存器高字节在前)
         for (int i = 0; i < registerCount; i++)
         {
             bytes[i * 2] = (byte)(registers[offset + i] >> 8);
             bytes[i * 2 + 1] = (byte)(registers[offset + i] & 0xFF);
         }
 
-        // 根据字节顺序调整
+        // 根据输入数据的字节顺序，转换为 BitConverter 需要的 Little-Endian 格式
+        // 输入格式 -> 需要的转换 -> BitConverter 期望的 DCBA
         return byteOrder switch
         {
-            ByteOrder.BigEndian => bytes, // ABCD
-            ByteOrder.LittleEndian => ReverseArray(bytes), // DCBA
-            ByteOrder.BigEndianByteSwap => SwapWordBytes(bytes), // BADC
-            ByteOrder.LittleEndianByteSwap => SwapWordBytesAndReverse(bytes), // CDAB
+            ByteOrder.BigEndian => ReverseArray(bytes),              // ABCD -> DCBA
+            ByteOrder.LittleEndian => bytes,                          // DCBA -> DCBA (已正确)
+            ByteOrder.BigEndianByteSwap => SwapWordBytesAndReverse(bytes), // BADC -> DCBA
+            ByteOrder.LittleEndianByteSwap => SwapWordBytes(bytes),   // CDAB -> DCBA
             _ => bytes
         };
     }
 
     private static ushort[] SetBytes(byte[] bytes, int registerCount, ByteOrder byteOrder)
     {
-        // 根据字节顺序调整
+        // BitConverter 产生的是 Little-Endian (DCBA)，需要转换为目标字节顺序
+        // DCBA -> 目标格式
         var orderedBytes = byteOrder switch
         {
-            ByteOrder.BigEndian => bytes, // ABCD
-            ByteOrder.LittleEndian => ReverseArray(bytes), // DCBA
-            ByteOrder.BigEndianByteSwap => SwapWordBytes(bytes), // BADC
-            ByteOrder.LittleEndianByteSwap => SwapWordBytesAndReverse(bytes), // CDAB
+            ByteOrder.BigEndian => ReverseArray(bytes),              // DCBA -> ABCD
+            ByteOrder.LittleEndian => bytes,                          // DCBA -> DCBA
+            ByteOrder.BigEndianByteSwap => SwapWordBytesAndReverse(bytes), // DCBA -> BADC
+            ByteOrder.LittleEndianByteSwap => SwapWordBytes(bytes),   // DCBA -> CDAB
             _ => bytes
         };
 
